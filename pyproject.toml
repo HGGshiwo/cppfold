@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cppfold"
+version = "0.1.0"
+description = "A CLI tool to fold and optimize unreadable C++ template errors."
+requires-python = ">=3.7"
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+
+[project.scripts]
+# 这行代码的意思是：安装后，终端里会有个 cppfold 命令，执行它等于执行 cppfold.cli:main
+cppfold = "cppfold.cli:main"
