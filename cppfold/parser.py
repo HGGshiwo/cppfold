@@ -1,121 +1,208 @@
 import re
 import sys
 
-class CppErrorParser:
+class GccSemanticParser:
     def __init__(self):
         self.type_map = {}
         self.counter = 1
-        # 常见无用且极长的 STL 类型，直接丢弃
         self.ignore_patterns = ["allocator<", "char_traits<", "default_delete<"]
         
-        # 匹配 GCC/Clang 报错起始行的正则表达式 (例如: /path/main.cpp:10:5: error: ...)
-        self.error_start_pattern = re.compile(r'(.*?:\d+:\d+: (?:error|warning):|CMake Error)')
+        # 缓存当前正在收集的错误块
+        self.current_block = {
+            "main_error": None,
+            "notes": [],
+            "stack_trace": [],
+            "raw_lines": [] # 如果解析失败，保留原始折叠输出
+        }
+        self.all_blocks = []
 
-    def fold_line(self, line):
+    def _fold_type(self, type_str):
+        """核心递归折叠算法，处理 < > 和 [with ]"""
         result = []
         i = 0
-        length = len(line)
+        length = len(type_str)
         
         while i < length:
-            match = re.match(r'([a-zA-Z0-9_:]+)<', line[i:])
-            if match:
-                base_name = match.group(1)
-                if base_name.endswith("operator") or "operator<" in base_name:
-                    result.append(line[i])
-                    i += 1
-                    continue
-                
-                start_idx = i + len(base_name)
+            # 处理 [with ...]
+            if type_str[i:].startswith('[with '):
+                start_idx = i
                 bracket_count = 1
-                j = start_idx + 1
-                
+                j = start_idx + 6
                 while j < length and bracket_count > 0:
-                    if line[j] == '<': bracket_count += 1
-                    elif line[j] == '>': bracket_count -= 1
+                    if type_str[j] == '[': bracket_count += 1
+                    elif type_str[j] == ']': bracket_count -= 1
                     j += 1
-                
                 if bracket_count == 0:
-                    inner_content = line[start_idx+1 : j-1]
+                    inner_content = type_str[start_idx+6 : j-1]
+                    folded_inner = self._fold_type(inner_content)
                     
-                    if len(inner_content) < 15:
-                        result.append(f"{base_name}<{inner_content}>")
-                        i = j
-                        continue
-
-                    if any(p in base_name for p in self.ignore_patterns):
-                        return ""
-
-                    folded_inner = self.fold_line(inner_content)
-                    
-                    type_id = f"T{self.counter}"
+                    tid = f"T{self.counter}"
                     self.counter += 1
-                    # 避免完全相同的类型重复生成 T1, T2
-                    # 这里可以做一个小优化：如果 folded_inner 已经存在，复用旧的 ID
-                    existing_id = next((k for k, v in self.type_map.items() if v == folded_inner), None)
-                    if existing_id:
-                        type_id = existing_id
+                    existing = next((k for k,v in self.type_map.items() if v == folded_inner), None)
+                    if existing:
+                        tid = existing
                         self.counter -= 1
                     else:
-                        self.type_map[type_id] = folded_inner
+                        self.type_map[tid] = folded_inner
                     
-                    # 颜色：青色高亮代号
-                    color_id = f"\033[1;36m[{type_id}]\033[0m"
-                    result.append(f"{base_name}<{color_id}>")
+                    result.append(f"[with \033[1;36m[{tid}]\033[0m]")
+                    i = j
+                    continue
+
+            # 处理 < >
+            match = re.match(r'([a-zA-Z0-9_:]+)<', type_str[i:])
+            if match:
+                base = match.group(1)
+                if base.endswith("operator") or "operator<" in base:
+                    result.append(type_str[i])
+                    i += 1
+                    continue
+                start_idx = i + len(base)
+                bracket_count = 1
+                j = start_idx + 1
+                while j < length and bracket_count > 0:
+                    if type_str[j] == '<': bracket_count += 1
+                    elif type_str[j] == '>': bracket_count -= 1
+                    j += 1
+                if bracket_count == 0:
+                    inner_content = type_str[start_idx+1 : j-1]
+                    if len(inner_content) < 15:
+                        result.append(f"{base}<{inner_content}>")
+                        i = j
+                        continue
+                    if any(p in base for p in self.ignore_patterns):
+                        return ""
+                        
+                    folded_inner = self._fold_type(inner_content)
+                    tid = f"T{self.counter}"
+                    self.counter += 1
+                    existing = next((k for k,v in self.type_map.items() if v == folded_inner), None)
+                    if existing:
+                        tid = existing
+                        self.counter -= 1
+                    else:
+                        self.type_map[tid] = folded_inner
+                        
+                    result.append(f"{base}<\033[1;36m[{tid}]\033[0m>")
                     i = j
                 else:
-                    result.append(line[i])
+                    result.append(type_str[i])
                     i += 1
             else:
-                result.append(line[i])
+                result.append(type_str[i])
                 i += 1
-                
         return "".join(result)
 
-    def print_dictionary_and_reset(self):
-        """打印当前收集到的局部字典，并重置计数器"""
-        output = ""
+    def _flush_current_block(self):
+        if self.current_block["main_error"]:
+            self.all_blocks.append(self.current_block)
+        self.current_block = {
+            "main_error": None,
+            "notes": [],
+            "stack_trace": [],
+            "raw_lines": []
+        }
+
+    def process_line(self, line):
+        clean_line = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', line).strip()
+        if not clean_line: return
+
+        # 1. 匹配主错误
+        err_match = re.match(r'(.*?:\d+:\d+): error: (.*)', clean_line)
+        if err_match:
+            self._flush_current_block()
+            self.current_block["main_error"] = {
+                "loc": err_match.group(1),
+                "msg": self._fold_type(err_match.group(2))
+            }
+            return
+
+        # 2. 匹配 Note / Candidate 逻辑
+        note_match = re.match(r'(.*?:\d+:\d+): note: (.*)', clean_line)
+        if note_match and self.current_block["main_error"]:
+            msg = note_match.group(2)
+            # 提炼：如果是关于 candidate 转换失败的，直接提取出人话
+            conv_match = re.search(r'no known conversion .*? from ‘(.*?)’ to ‘(.*?)’', msg)
+            if conv_match:
+                self.current_block["notes"].append({
+                    "type": "conversion_fail",
+                    "from": self._fold_type(conv_match.group(1)),
+                    "to": self._fold_type(conv_match.group(2))
+                })
+            elif "candidate:" in msg:
+                cand = msg.split("candidate:", 1)[1].strip()
+                self.current_block["notes"].append({
+                    "type": "candidate",
+                    "func": self._fold_type(cand)
+                })
+            elif "declaration of" in msg:
+                pass # 忽略无用的 declaration 废话
+            else:
+                self.current_block["notes"].append({"type": "raw", "msg": self._fold_type(msg)})
+            return
+
+        # 3. 匹配实例化堆栈 (In instantiation of / required from)
+        if "In instantiation of" in clean_line or "required from" in clean_line:
+            match = re.search(r'(.*?:\d+:\d+:|In file included from .*?:)\s*(.*)', clean_line)
+            if match:
+                self.current_block["stack_trace"].append({
+                    "loc": match.group(1).replace('In file included from', '').strip(' :'),
+                    "ctx": self._fold_type(match.group(2).replace('required from ', '').replace('In instantiation of ', ''))
+                })
+            return
+
+        # 如果都不是，先暂存到 raw (可能是报错的代码切片，比如带有 ^ 的那行)
+        if self.current_block["main_error"] and clean_line:
+            self.current_block["raw_lines"].append(clean_line)
+
+    def generate_human_report(self):
+        self._flush_current_block()
+        if not self.all_blocks:
+            return ""
+
+        report = []
+        for i, block in enumerate(self.all_blocks):
+            report.append(f"\033[91m{'='*60}\033[0m")
+            report.append(f"\033[1;91m❌ ERROR {i+1}: \033[0m{block['main_error']['msg']}")
+            report.append(f"\033[91m{'='*60}\033[0m\n")
+            
+            report.append(f"\033[1;93m📍 Location:\033[0m\n  {block['main_error']['loc']}")
+
+            # 语义化提炼
+            reason_generated = False
+            for note in block["notes"]:
+                if note["type"] == "conversion_fail":
+                    report.append(f"\n\033[1;92m🤔 Human Translation (人话解释):\033[0m")
+                    report.append(f"  You are trying to pass an argument of type:")
+                    report.append(f"    👉 \033[1;35m{note['from']}\033[0m")
+                    report.append(f"  But the receiving function/lambda expects:")
+                    report.append(f"    👉 \033[1;35m{note['to']}\033[0m")
+                    report.append(f"  \033[90m(Tip: This usually happens in std::visit when a variant contains a type your lambda doesn't handle.)\033[0m")
+                    reason_generated = True
+                    break
+            
+            if not reason_generated:
+                # 把代码片段打出来
+                code_snippet = "\n".join(block["raw_lines"][:2])
+                if code_snippet:
+                    report.append(f"\n\033[1;94m💻 Code Snippet:\033[0m\n  {code_snippet}")
+
+            # 简化并反转的堆栈
+            if block["stack_trace"]:
+                report.append(f"\n\033[1;95m🥞 Template Call Stack (Top-down):\033[0m")
+                # 倒序排列，让最外层调用在上面
+                for idx, trace in enumerate(reversed(block["stack_trace"])):
+                    report.append(f"  {idx+1}. {trace['loc']}")
+                    report.append(f"     └─ {trace['ctx']}")
+
+            report.append("\n")
+
+        # 追加字典
         if self.type_map:
-            output += "\n\033[93m" + "-"*60 + "\033[0m\n"
-            output += "\033[1;96m[ Template Dictionary (Local) ]\033[0m\n"
+            report.append(f"\033[93m{'-'*60}\033[0m")
+            report.append("\033[1;96m[ Template Dictionary (T1, T2...) ]\033[0m")
             for tid, content in self.type_map.items():
-                output += f"  \033[1;36m[{tid}]\033[0m = {content}\n"
-            output += "\033[93m" + "-"*60 + "\033[0m\n\n"
-            
-        # 核心：重置字典！
-        self.type_map.clear()
-        self.counter = 1
-        return output
+                report.append(f"  \033[1;36m[{tid}]\033[0m = {content}")
+            report.append(f"\033[93m{'-'*60}\033[0m\n")
 
-    def process_stream(self, stream, output_list=None):
-        """
-        stream: 输入的可迭代对象(行)
-        output_list: 如果传入列表，则将结果存入列表（用于分页），否则直接打印
-        """
-        for line in stream:
-            # 如果检测到新的错误块，先把上一个报错的字典打印出来
-            # 清除 ANSI 颜色代码以便正则匹配
-            clean_line = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', line)
-            
-            if self.error_start_pattern.search(clean_line):
-                dict_str = self.print_dictionary_and_reset()
-                if dict_str:
-                    if output_list is not None:
-                        output_list.append(dict_str)
-                    else:
-                        sys.stdout.write(dict_str)
-
-            folded_line = self.fold_line(line)
-            
-            if output_list is not None:
-                output_list.append(folded_line)
-            else:
-                sys.stdout.write(folded_line)
-                sys.stdout.flush()
-                
-        # 处理结束后，确保最后一块字典也被打印
-        dict_str = self.print_dictionary_and_reset()
-        if dict_str:
-            if output_list is not None:
-                output_list.append(dict_str)
-            else:
-                sys.stdout.write(dict_str)
+        return "\n".join(report)
