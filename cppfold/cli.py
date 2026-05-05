@@ -1,64 +1,109 @@
 import sys
 import os
+import pty
 import subprocess
+import select
 from .parser import CppErrorParser
 
+def page_output(text_lines):
+    """调用系统的 less 命令实现分页显示"""
+    text = "".join(text_lines)
+    try:
+        # -R 允许显示 ANSI 颜色, -F 如果一页能装下则直接退出, -X 不清屏
+        process = subprocess.Popen(['less', '-R', '-F', '-X'], stdin=subprocess.PIPE, text=True)
+        process.communicate(text)
+    except FileNotFoundError:
+        # 如果没有 less 命令，退化为直接打印
+        sys.stdout.write(text)
+
 def main():
+    # 简单的参数解析：如果有 --page，则开启分页模式
     args = sys.argv[1:]
-    parser = CppErrorParser()
+    use_pager = False
+    if '--page' in args:
+        use_pager = True
+        args.remove('--page')
 
     if not args:
-        # 模式1：管道模式 (e.g., catkin_make 2>&1 | cppfold)
-        # 如果没有跟任何参数，就从标准输入读取
-        if sys.stdin.isatty():
-            print("Usage: cppfold <build_command> OR <build_command> 2>&1 | cppfold")
-            sys.exit(1)
+        print("Usage: cppfold [--page] <build_command>")
+        sys.exit(1)
+
+    parser = CppErrorParser()
+    buffered_output = [] if use_pager else None
+
+    # 使用 pty (伪终端) 启动子进程，这是保留编译器颜色的终极杀器
+    master_fd, slave_fd = pty.openpty()
+
+    try:
+        process = subprocess.Popen(
+            args,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True
+        )
+    except FileNotFoundError:
+        print(f"\033[91mError: Command '{args[0]}' not found.\033[0m")
+        sys.exit(1)
+
+    os.close(slave_fd) # 父进程不需要 slave
+
+    try:
+        # 非阻塞读取 PTY 输出
+        while True:
+            r, _, _ = select.select([master_fd], [], [], 0.1)
+            if master_fd in r:
+                try:
+                    data = os.read(master_fd, 4096)
+                    if not data:
+                        break
+                    
+                    # 将 byte 转换为 text，按行分割但保留换行符
+                    text = data.decode('utf-8', errors='replace')
+                    lines = [line + '\n' for line in text.split('\n')]
+                    # 如果末尾刚好是 \n，split 会多出一个空字符串
+                    if lines[-1] == '\n':
+                        lines.pop()
+
+                    # 逐行处理
+                    parser.process_stream(lines, output_list=buffered_output)
+
+                except OSError:
+                    # PTY 在子进程结束时通常会抛出 OSError
+                    break
+            
+            # 检查子进程是否结束
+            if process.poll() is not None:
+                # 确保读取完最后的数据
+                try:
+                    data = os.read(master_fd, 4096)
+                    if data:
+                        text = data.decode('utf-8', errors='replace')
+                        lines = [line + '\n' for line in text.split('\n')]
+                        if lines[-1] == '\n': lines.pop()
+                        parser.process_stream(lines, output_list=buffered_output)
+                except OSError:
+                    pass
+                break
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        os.close(master_fd)
         
-        try:
-            parser.process_stream(sys.stdin)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            parser.print_dictionary()
-            sys.exit(0)
+        # 如果还在字典里残留了最后的错误，刷出来
+        dict_str = parser.print_dictionary_and_reset()
+        if dict_str:
+            if buffered_output is not None:
+                buffered_output.append(dict_str)
+            else:
+                sys.stdout.write(dict_str)
 
-    else:
-        # 模式2：包装器模式 (e.g., cppfold catkin_make -j4)
-        # 强制编译器输出颜色 (非常重要)
-        env = os.environ.copy()
-        env['FORCE_COLOR'] = '1'
-        env['GCC_COLORS'] = 'error=01;31:warning=01;35:note=01;36:caret=01;32:locus=01:quote=01'
-        env['CLANG_FORCE_COLOR_DIAGNOSTICS'] = '1'
+        # 核心：如果是 --page 模式，在此刻统一调用 less 显示
+        if use_pager and buffered_output:
+            page_output(buffered_output)
 
-        try:
-            # 启动子进程，将 stderr 合并到 stdout 一起实时读取
-            process = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, # 把报错和正常输出合并
-                text=True,                # 以字符串模式读取
-                env=env,
-                bufsize=1
-            )
-
-            # 实时读取并处理
-            parser.process_stream(process.stdout)
-            
-            # 等待子进程结束并获取状态码
-            process.wait()
-            
-            # 打印字典
-            parser.print_dictionary()
-            
-            # 完美转发原始命令的状态码
-            sys.exit(process.returncode)
-
-        except FileNotFoundError:
-            print(f"\033[91mError: Command '{args[0]}' not found.\033[0m")
-            sys.exit(1)
-        except KeyboardInterrupt:
-            # 允许用户按 Ctrl+C 中断编译
-            sys.exit(130)
+    sys.exit(process.returncode)
 
 if __name__ == "__main__":
     main()

@@ -8,3 +8,9 @@ pip install git+https://github.com/HGGshiwo/cppfold.git
 cppfold catkin_make
 cppfold cmake -j8
 ```
+
+with page:
+
+```
+cppfold --page catkin_make
+```
